@@ -1,0 +1,933 @@
+<!DOCTYPE html>
+<html lang="th" style="background-color: transparent;"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="10K">
+<meta name="theme-color" content="#0E1C24">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 180 180%22%3E%3Crect width=%22180%22 height=%22180%22 rx=%2240%22 fill=%22%230E1C24%22/%3E%3Ctext x=%2290%22 y=%22104%22 font-family=%22-apple-system,sans-serif%22 font-size=%2266%22 font-weight=%22800%22 fill=%22%23E9A13B%22 text-anchor=%22middle%22%3E10K%3C/text%3E%3Ctext x=%2290%22 y=%22138%22 font-family=%22-apple-system,sans-serif%22 font-size=%2222%22 fill=%22%239FB3B4%22 text-anchor=%22middle%22%3ETRAINING%3C/text%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 180 180%22%3E%3Crect width=%22180%22 height=%22180%22 rx=%2240%22 fill=%22%230E1C24%22/%3E%3Ctext x=%2290%22 y=%22104%22 font-family=%22-apple-system,sans-serif%22 font-size=%2266%22 font-weight=%22800%22 fill=%22%23E9A13B%22 text-anchor=%22middle%22%3E10K%3C/text%3E%3Ctext x=%2290%22 y=%22138%22 font-family=%22-apple-system,sans-serif%22 font-size=%2222%22 fill=%22%239FB3B4%22 text-anchor=%22middle%22%3ETRAINING%3C/text%3E%3C/svg%3E">
+<title>10K training</title>
+<style>
+  :root{
+    --bg:#0E1C24; --card:#152A33; --ink:#E4EBEA; --dim:#9FB3B4;
+    --line:rgba(228,235,234,.15); --teal:#2E7D74; --gold:#E9A13B; --coral:#D9524B;
+    --f:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans Thai","Sarabun",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+  html,body{background:#0E1C24;min-height:100%}
+  body{color:#E4EBEA;font-family:var(--f);font-size:15px;line-height:1.55;padding:0 0 calc(60px + env(safe-area-inset-bottom))}
+  .wrap{max-width:600px;margin:0 auto;padding:0 calc(16px + env(safe-area-inset-left)) 0 calc(16px + env(safe-area-inset-right))}
+
+  header{padding:calc(26px + env(safe-area-inset-top)) 0 20px;border-bottom:1px solid var(--line)}
+  .kicker{font-size:11px;letter-spacing:.2em;color:var(--dim);text-transform:uppercase}
+  h1{display:none}
+  .cd{display:flex;align-items:baseline;gap:11px;margin-top:13px}
+  .cd-n{font-size:58px;font-weight:800;color:var(--gold);line-height:.88;letter-spacing:-.02em}
+  .cd-l{font-size:15px;font-weight:600}
+  .lede{font-size:13px;color:var(--dim);margin-top:11px}
+
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);
+    border:1px solid var(--line);border-radius:5px;margin:20px 0 4px;overflow:hidden}
+  .st{background:var(--card);padding:13px 11px}
+  .st-v{font-size:24px;font-weight:700;line-height:1.1}
+  .st-v small{font-size:11px;font-weight:400;color:var(--dim)}
+  .st-l{font-size:10.5px;color:var(--dim);margin-top:2px}
+
+  .legend{display:flex;gap:15px;flex-wrap:wrap;padding:14px 0 2px;font-size:11.5px;color:var(--dim)}
+  .lg{display:flex;align-items:center;gap:6px}
+  .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+
+  .sv{font-size:11px;color:var(--dim);text-align:right;padding:6px 0 0}
+  .sv.bad{color:var(--coral);text-align:left;background:rgba(217,82,75,.12);
+    border:1px solid rgba(217,82,75,.35);border-radius:5px;padding:9px 11px;margin:10px 0 0}
+
+  .wk{margin-top:24px}
+  .wk-h{display:flex;align-items:baseline;gap:9px;padding-bottom:9px;
+    border-bottom:1px solid var(--line)}
+  .wk-n{font-size:14px;font-weight:700;color:var(--gold);letter-spacing:.03em}
+  .wk-d{font-size:12px;color:var(--dim)}
+  .wk-p{margin-left:auto;font-size:10.5px;letter-spacing:.07em;color:var(--dim);
+    border:1px solid var(--line);border-radius:3px;padding:2px 8px}
+  .wk-p.now{color:#0E1C24;background:var(--gold);border-color:var(--gold);font-weight:700}
+
+  .row{display:grid;grid-template-columns:28px 1fr;position:relative}
+  .sp{position:relative}
+  .sp:before{content:"";position:absolute;left:9px;top:0;bottom:0;width:2px;background:var(--line)}
+  .row:first-of-type .sp:before{top:24px}
+  .row:last-of-type .sp:before{bottom:calc(100% - 24px)}
+  .node{position:absolute;left:3px;top:18px;width:13px;height:13px;border-radius:50%;
+    border:2px solid var(--dim);background:var(--bg);z-index:2}
+  .node.done{border-color:transparent}
+  .node.race{width:17px;height:17px;left:1px;border-color:var(--gold);background:var(--gold)}
+
+  .bc{padding:14px 0 14px 4px;border-bottom:1px solid var(--line)}
+  .row:last-of-type .bc{border-bottom:none}
+  .r-top{display:grid;grid-template-columns:48px 1fr auto;gap:9px;align-items:baseline}
+  .r-d{font-size:12.5px;font-weight:700;color:var(--dim)}
+  .row.on .r-d{color:var(--teal)}
+  .r-t{font-size:15px}
+  .r-t b{font-weight:700}
+  .r-m{font-size:12px;color:var(--dim);margin:3px 0 0 57px}
+  .tap{background:transparent;border:1px solid var(--line);border-radius:4px;
+    font-family:var(--f);font-size:12px;color:var(--dim);padding:5px 11px;cursor:pointer}
+  .tap.has{background:var(--teal);border-color:var(--teal);color:#fff;font-weight:600}
+
+  .res{margin:8px 0 0 57px;display:flex;gap:15px;flex-wrap:wrap;font-size:15px;font-weight:700}
+  .res span{color:var(--dim);font-weight:400;font-size:11.5px}
+  .note{margin:5px 0 0 57px;font-size:12px;color:var(--dim);font-style:italic}
+  .vd{margin:9px 0 0 57px;font-size:12.5px;line-height:1.5;padding:9px 11px;border-radius:5px}
+  .vd b{display:block;font-size:10.5px;letter-spacing:.08em;margin-bottom:3px;text-transform:uppercase}
+  .vd.v0{background:rgba(46,125,116,.16);color:#BDDBD5} .vd.v0 b{color:#5FB3A6}
+  .vd.v1{background:rgba(233,161,59,.14);color:#EBD5AE} .vd.v1 b{color:var(--gold)}
+  .vd.v2{background:rgba(217,82,75,.15);color:#EFC3BF} .vd.v2 b{color:#E8756D}
+  .dec{margin:9px 0 0 57px;font-size:11.5px;color:var(--gold);
+    border-left:2px solid var(--gold);padding-left:10px;line-height:1.5}
+
+  .edit{margin:12px 0 2px 57px;padding:14px;background:var(--card);
+    border:1px solid var(--line);border-radius:6px}
+  .fl{margin-bottom:12px}
+  .fl:last-of-type{margin-bottom:0}
+  label{display:block;font-size:11.5px;color:var(--dim);margin-bottom:5px}
+  input{width:100%;background:rgba(228,235,234,.07);border:1px solid var(--line);
+    border-radius:4px;color:var(--ink);font-family:var(--f);font-size:16px;
+    font-weight:600;padding:10px 12px}
+  input:focus{outline:none;border-color:var(--gold)}
+  input::placeholder{color:rgba(159,179,180,.45);font-weight:400}
+  .duo{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .chips{display:flex;gap:7px}
+  .chip{flex:1;background:rgba(228,235,234,.06);border:1px solid var(--line);
+    border-radius:4px;padding:10px 3px;font-family:var(--f);font-size:13px;
+    color:var(--dim);cursor:pointer;text-align:center}
+  .chip.on{border-color:transparent;font-weight:700}
+  .chip[data-v="0"].on{background:var(--teal);color:#fff}
+  .chip[data-v="1"].on{background:var(--gold);color:#0E1C24}
+  .chip[data-v="2"].on{background:var(--coral);color:#fff}
+  .pv{background:rgba(233,161,59,.1);border:1px solid rgba(233,161,59,.3);border-radius:4px;
+    padding:9px 12px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center}
+  .pv-l{font-size:11.5px;color:var(--dim)}
+  .pv-v{font-size:20px;font-weight:700;color:var(--gold)}
+  .acts{display:flex;gap:8px}
+  .b{padding:12px;border-radius:4px;border:none;cursor:pointer;
+    font-family:var(--f);font-size:14px;font-weight:700}
+  .b1{background:var(--gold);color:#0E1C24;flex:1}
+  .b2{background:transparent;color:var(--dim);border:1px solid var(--line);flex:0 0 68px}
+  .b3{background:transparent;color:var(--coral);border:1px solid rgba(217,82,75,.4);flex:0 0 68px}
+
+  .card{background:var(--card);border:1px solid var(--line);border-radius:6px;
+    padding:15px 16px;margin:24px 0 11px}
+  .card h2{font-size:14px;margin-bottom:9px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  td{padding:8px 0;border-bottom:1px solid var(--line);color:var(--dim)}
+  tr:last-child td{border-bottom:none}
+  .foot{font-size:11.5px;color:var(--dim);line-height:1.6;padding-top:6px}
+  .rst{background:none;border:none;color:var(--dim);font-family:var(--f);
+    font-size:11.5px;text-decoration:underline;cursor:pointer;padding:0;margin-top:8px}
+  .hide{display:none}
+  .err{background:rgba(217,82,75,.15);border:1px solid rgba(217,82,75,.4);color:#EFC3BF;
+    padding:12px;border-radius:5px;font-size:13px;margin-bottom:12px}
+</style>
+</head>
+<body id="artifacts-component-root-html" style="background-color: transparent;">
+<div class="wrap">
+
+  <header>
+    <div class="kicker">10K TRAINING · 26 ก.ย. 2026</div>
+    <div class="cd"><div class="cd-n" id="cdn">38</div><div class="cd-l">วันก่อนแข่ง</div></div>
+    <div class="lede" id="lede">เหลือ 5 สัปดาห์ 3 วัน · เป้า 1:35:00 · race pace 9:30 /กม.</div>
+  </header>
+
+  <div id="err"></div>
+
+  <div class="stats">
+    <div class="st"><div class="st-v" id="sD">0<small>/18</small></div><div class="st-l">ซ้อมแล้ว</div></div>
+    <div class="st"><div class="st-v" id="sK">0.0<small> กม.</small></div><div class="st-l">ระยะสะสม</div></div>
+    <div class="st"><div class="st-v" id="sP">—</div><div class="st-l">เพซเฉลี่ย</div></div>
+  </div>
+
+  <div class="legend">
+    <div class="lg"><span class="dot" style="background:#2E7D74"></span>หน้าแข้งปกติ</div>
+    <div class="lg"><span class="dot" style="background:#E9A13B"></span>ตึง ๆ</div>
+    <div class="lg"><span class="dot" style="background:#D9524B"></span>เจ็บ</div>
+    <div class="lg"><span class="dot" style="border:2px solid #9FB3B4"></span>ยังไม่ซ้อม</div>
+  </div>
+  <div class="sv" id="sv">คัดลอกโค้ดแล้ว (51 KB) เอาไปวางในไฟล์ index.html บน GitHub</div>
+  <div id="plan"><div class="wk"><div class="wk-h"><div class="wk-n">สัปดาห์ 1</div><div class="wk-d">17–23 ส.ค.</div><div class="wk-p now">ตอนนี้</div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">อ. 18</div><div class="r-t">Easy run <b>4 กม.</b></div><button class="tap" data-id="a1">บันทึก</button></div><div class="r-m">ที่ 10:30 /กม. · HR 141–150 · เป้า 10:30 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">พฤ. 20</div><div class="r-t">Interval <b>5 × 2 นาที</b></div><button class="tap" data-id="a2">บันทึก</button></div><div class="r-m">วอร์ม 10 นาที · แล้วทำ 5 รอบ = วิ่งเร็ว 2 นาที ที่ 9:00 + เดิน 2 นาที · คูลดาวน์ 5 นาที · เป้า 10:00 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">ส. 22</div><div class="r-t">Long run <b>7 กม.</b></div><button class="tap" data-id="a3">บันทึก</button></div><div class="r-m">ที่ 10:15 /กม. · พื้นราบ ครึ่งหลังค่อยเร่ง · เป้า 10:15 /กม.</div></div></div></div><div class="wk"><div class="wk-h"><div class="wk-n">สัปดาห์ 2</div><div class="wk-d">24–30 ส.ค.</div><div class="wk-p">สร้างฐาน</div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">อ. 25</div><div class="r-t">Easy run <b>5 กม.</b></div><button class="tap" data-id="b1">บันทึก</button></div><div class="r-m">ที่ 10:30 /กม. · HR 141–150 · เป้า 10:30 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">พฤ. 27</div><div class="r-t">Tempo <b>2 × 6 นาที</b></div><button class="tap" data-id="b2">บันทึก</button></div><div class="r-m">วอร์ม 10 นาที · วิ่งต่อเนื่อง 6 นาที ที่ 9:00–9:15 · เดินพัก 3 นาที · วิ่งอีก 6 นาที · คูลดาวน์ · เป้า 10:00 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">ส. 29</div><div class="r-t">Long run <b>8 กม.</b></div><button class="tap" data-id="b3">บันทึก</button></div><div class="r-m">ที่ 10:15 /กม. · วิ่ง 6 นาที / เดิน 1 นาที · เป้า 10:15 /กม.</div></div></div></div><div class="wk"><div class="wk-h"><div class="wk-n">สัปดาห์ 3</div><div class="wk-d">31 ส.ค.–6 ก.ย.</div><div class="wk-p">สร้างฐาน</div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">อ. 1</div><div class="r-t">Easy run <b>5 กม.</b></div><button class="tap" data-id="c1">บันทึก</button></div><div class="r-m">ที่ 10:30 /กม. · HR 141–150 · เป้า 10:30 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">พฤ. 3</div><div class="r-t">Hill repeats <b>8 × 1 นาที</b></div><button class="tap" data-id="c2">บันทึก</button></div><div class="r-m">วอร์ม 10 นาที · แล้วทำ 8 เที่ยว = วิ่งขึ้นเนิน 1 นาที + เดินลง 1:30 · ห้ามวิ่งลง · ลู่ วิ่ง 5.5 km/h ชัน 6% / เดิน 4.5 km/h ชัน 0%</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">ส. 5</div><div class="r-t">Long run <b>9 กม.</b></div><button class="tap" data-id="c3">บันทึก</button></div><div class="r-m">ที่ 9:50 /กม. · วิ่ง 8 นาที / เดิน 1 นาที · เป้า 9:50 /กม.</div><div class="dec">จุดตัดสินใจ · ต่ำกว่า 9:20 → ลุ้น 1:30 ได้ · 9:20–9:50 → เป้า 1:35 มั่นคง · ช้ากว่า 9:50 → ปรับเป็น 1:40</div></div></div></div><div class="wk"><div class="wk-h"><div class="wk-n">สัปดาห์ 4</div><div class="wk-d">7–13 ก.ย.</div><div class="wk-p">ผ่อน</div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">อ. 8</div><div class="r-t">Easy run <b>4 กม.</b></div><button class="tap" data-id="d1">บันทึก</button></div><div class="r-m">ที่ 10:30 /กม. · HR 141–150 · สัปดาห์ผ่อน · เป้า 10:30 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">พฤ. 10</div><div class="r-t">Tempo <b>2 × 8 นาที</b></div><button class="tap" data-id="d2">บันทึก</button></div><div class="r-m">วอร์ม 10 นาที · วิ่งต่อเนื่อง 8 นาที ที่ 9:00–9:15 · เดินพัก 3 นาที · วิ่งอีก 8 นาที · คูลดาวน์ · เป้า 10:00 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">ส. 12</div><div class="r-t">Long run <b>6 กม.</b></div><button class="tap" data-id="d3">บันทึก</button></div><div class="r-m">ที่ 10:15 /กม. · ผ่อนโหลด อย่าข้ามสัปดาห์นี้ · เป้า 10:15 /กม.</div></div></div></div><div class="wk"><div class="wk-h"><div class="wk-n">สัปดาห์ 5</div><div class="wk-d">14–20 ก.ย.</div><div class="wk-p">หนักสุด</div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">อ. 15</div><div class="r-t">Easy run <b>5 กม.</b></div><button class="tap" data-id="e1">บันทึก</button></div><div class="r-m">ที่ 10:30 /กม. · HR 141–150 · เป้า 10:30 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">พฤ. 17</div><div class="r-t"><b>3 กม.</b> ที่เพซวันแข่ง</div><button class="tap" data-id="e2">บันทึก</button></div><div class="r-m">วิ่ง 3 กม. รวดเดียว ที่ 9:15–9:30 ไม่หยุด ไม่เดิน · จบแล้วเดินพัก 3 นาที ต่อด้วย 4 × (วิ่งเร็ว 1 นาที + เดิน 1 นาที) · เป้า 9:30 /กม.</div><div class="dec">เมนูนี้ฝึกจำความรู้สึกของเพซวันแข่ง สิ่งสำคัญคือทั้ง 3 กิโลเพซเท่ากัน ไม่ใช่เฉลี่ยได้ · ถ้ากิโลแรก 9:00 กิโลสอง 9:40 ถือว่าไม่ผ่าน แม้เฉลี่ยจะได้ 9:20</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">ส. 19</div><div class="r-t">Long run <b>9.5 กม.</b> ซ้อมเสมือนจริง</div><button class="tap" data-id="e3">บันทึก</button></div><div class="r-m">ที่ 9:35 /กม. · ชุดเดิม เวลาเดิม วิ่ง 9 / เดิน 1 · เป้า 9:36 /กม.</div><div class="dec">ถ้าทำได้ 9:35 โดยไม่หมดแรง = พร้อมสำหรับ 1:35 แน่นอน</div></div></div></div><div class="wk"><div class="wk-h"><div class="wk-n">สัปดาห์ 6</div><div class="wk-d">21–26 ก.ย.</div><div class="wk-p">ก่อนแข่ง</div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">อ. 22</div><div class="r-t">Easy run <b>4 กม.</b></div><button class="tap" data-id="f1">บันทึก</button></div><div class="r-m">ที่ 10:30 /กม. · HR 141–150 · ขาจะเริ่มอยากวิ่ง อย่าเพิ่ม · เป้า 10:30 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">พฤ. 24</div><div class="r-t"><b>3 กม.</b> + strides</div><button class="tap" data-id="f2">บันทึก</button></div><div class="r-m">วิ่งสบาย ๆ 3 กม. HR ไม่เกิน 150 · จบแล้วต่อด้วย 4 × (วิ่งเร็ว 20 วินาที + เดินพักจนหายเหนื่อย) · เป้า 10:30 /กม.</div></div></div><div class="row"><div class="sp"><div class="node race"></div></div><div class="bc"><div class="r-top"><div class="r-d">ส. 26</div><div class="r-t">🏁 <b>แข่ง 10K</b></div><button class="tap" data-id="f3">บันทึก</button></div><div class="r-m">วิ่ง 9 นาที / เดิน 1 นาที · เป้า 9:30 /กม.</div><div class="dec">กม.1–3 ที่ 9:45 หัวใจ 145–155 · กม.4–8 ที่ 9:25 หัวใจ 152–162 · กม.9–10 ปล่อยเต็มที่</div></div></div></div></div>
+
+  <div class="card">
+    <h2>โซนหัวใจ</h2>
+    <table>
+      <tbody><tr><td>Z1 ฟื้นตัว</td><td style="text-align:right;color:#E4EBEA;font-weight:700">130–141</td></tr>
+      <tr><td>Z2 Easy run · Long run</td><td style="text-align:right;color:#5FB3A6;font-weight:700">141–152</td></tr>
+      <tr><td>Z3 Tempo</td><td style="text-align:right;color:#E4EBEA;font-weight:700">153–164</td></tr>
+      <tr><td>Z4 Interval</td><td style="text-align:right;color:#E4EBEA;font-weight:700">164–173</td></tr>
+      <tr><td>วันแข่ง กม.1–3</td><td style="text-align:right;color:#E9A13B;font-weight:700">145–155</td></tr>
+      <tr><td>วันแข่ง กม.4–8</td><td style="text-align:right;color:#E9A13B;font-weight:700">152–162</td></tr>
+    </tbody></table>
+    <div style="font-size:11.5px;color:#9FB3B4;margin-top:10px;line-height:1.5">
+      คำนวณจาก HR ขณะพัก 72 · อายุ 30 · HRmax ประมาณ 187 ด้วยวิธี Karvonen
+      <br>วัน easy run ควรอยู่ครึ่งล่างของ Z2 คือ 141–148
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>กฎที่ห้ามละเมิด</h2>
+    <table>
+      <tbody><tr><td>ห้ามวิ่งสองวันติดกัน ต้องเว้นอย่างน้อย 1 วันเสมอ</td></tr>
+      <tr><td>เจ็บเกิน 4 จาก 10 หรือเจ็บมากขึ้นระหว่างวิ่ง ให้หยุดวันนั้นทันที</td></tr>
+      <tr><td>บันทึกว่าเจ็บ 2 ครั้งติดกัน ให้พัก 3–5 วัน ไม่ต้องต่อรอง</td></tr>
+      <tr><td>สัปดาห์ผ่อนห้ามข้าม ร่างกายแข็งแรงขึ้นตอนพัก ไม่ใช่ตอนซ้อม</td></tr>
+    </tbody></table>
+  </div>
+
+  <div class="foot">
+    แตะปุ่มขวามือของแต่ละวันเพื่อบันทึกผล ระบบจะประเมินให้ทันทีว่าตามเป้าไหม
+    <div style="margin-top:14px">
+      <button class="rst" id="src" style="color:#E9A13B">คัดลอกโค้ดทั้งหมด (เอาไปวางใน GitHub)</button>
+      <br><br>
+      <button class="rst" id="exp">สำรองข้อมูล (คัดลอกเก็บไว้)</button> ·
+      <button class="rst" id="imp">กู้ข้อมูลจากที่สำรองไว้</button> ·
+      <button class="rst" id="rst">ล้างข้อมูลทั้งหมด</button>
+    </div>
+    <textarea id="box" class="" style="width:100%;margin-top:11px;padding:10px;
+      background:rgba(228,235,234,.07);border:1px solid rgba(228,235,234,.15);
+      border-radius:4px;color:#E4EBEA;font-family:monospace;font-size:11px;
+      height:130px"></textarea>
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  function $(i){return document.getElementById(i);}
+  function fail(m){ $("err").innerHTML='<div class="err">'+m+'</div>'; }
+
+  try{
+
+  var KEY="run10k";
+  var RACE=new Date(2026,8,26);
+
+  var PLAN=[
+  {w:1,d:"17–23 ส.ค.",p:"สร้างฐาน",s:[
+    {id:"a1",day:"อ. 18",t:"Easy run <b>4 กม.</b>",tp:10.5,td:4,ty:"easy",m:"ที่ 10:30 /กม. · HR 141–150"},
+    {id:"a2",day:"พฤ. 20",t:"Interval <b>5 × 2 นาที</b>",tp:10.0,td:5,ty:"q",m:"วอร์ม 10 นาที · แล้วทำ 5 รอบ = วิ่งเร็ว 2 นาที ที่ 9:00 + เดิน 2 นาที · คูลดาวน์ 5 นาที"},
+    {id:"a3",day:"ส. 22",t:"Long run <b>7 กม.</b>",tp:10.25,td:7,ty:"long",m:"ที่ 10:15 /กม. · พื้นราบ ครึ่งหลังค่อยเร่ง"}]},
+  {w:2,d:"24–30 ส.ค.",p:"สร้างฐาน",s:[
+    {id:"b1",day:"อ. 25",t:"Easy run <b>5 กม.</b>",tp:10.5,td:5,ty:"easy",m:"ที่ 10:30 /กม. · HR 141–150"},
+    {id:"b2",day:"พฤ. 27",t:"Tempo <b>2 × 6 นาที</b>",tp:10.0,td:5,ty:"q",m:"วอร์ม 10 นาที · วิ่งต่อเนื่อง 6 นาที ที่ 9:00–9:15 · เดินพัก 3 นาที · วิ่งอีก 6 นาที · คูลดาวน์"},
+    {id:"b3",day:"ส. 29",t:"Long run <b>8 กม.</b>",tp:10.25,td:8,ty:"long",m:"ที่ 10:15 /กม. · วิ่ง 6 นาที / เดิน 1 นาที"}]},
+  {w:3,d:"31 ส.ค.–6 ก.ย.",p:"สร้างฐาน",s:[
+    {id:"c1",day:"อ. 1",t:"Easy run <b>5 กม.</b>",tp:10.5,td:5,ty:"easy",m:"ที่ 10:30 /กม. · HR 141–150"},
+    {id:"c2",day:"พฤ. 3",t:"Hill repeats <b>8 × 1 นาที</b>",tp:0,td:5,ty:"none",m:"วอร์ม 10 นาที · แล้วทำ 8 เที่ยว = วิ่งขึ้นเนิน 1 นาที + เดินลง 1:30 · ห้ามวิ่งลง · ลู่ วิ่ง 5.5 km/h ชัน 6% / เดิน 4.5 km/h ชัน 0%"},
+    {id:"c3",day:"ส. 5",t:"Long run <b>9 กม.</b>",tp:9.83,td:9,ty:"long",m:"ที่ 9:50 /กม. · วิ่ง 8 นาที / เดิน 1 นาที",
+     dec:"จุดตัดสินใจ · ต่ำกว่า 9:20 → ลุ้น 1:30 ได้ · 9:20–9:50 → เป้า 1:35 มั่นคง · ช้ากว่า 9:50 → ปรับเป็น 1:40"}]},
+  {w:4,d:"7–13 ก.ย.",p:"ผ่อน",s:[
+    {id:"d1",day:"อ. 8",t:"Easy run <b>4 กม.</b>",tp:10.5,td:4,ty:"easy",m:"ที่ 10:30 /กม. · HR 141–150 · สัปดาห์ผ่อน"},
+    {id:"d2",day:"พฤ. 10",t:"Tempo <b>2 × 8 นาที</b>",tp:10.0,td:5,ty:"q",m:"วอร์ม 10 นาที · วิ่งต่อเนื่อง 8 นาที ที่ 9:00–9:15 · เดินพัก 3 นาที · วิ่งอีก 8 นาที · คูลดาวน์"},
+    {id:"d3",day:"ส. 12",t:"Long run <b>6 กม.</b>",tp:10.25,td:6,ty:"long",m:"ที่ 10:15 /กม. · ผ่อนโหลด อย่าข้ามสัปดาห์นี้"}]},
+  {w:5,d:"14–20 ก.ย.",p:"หนักสุด",s:[
+    {id:"e1",day:"อ. 15",t:"Easy run <b>5 กม.</b>",tp:10.5,td:5,ty:"easy",m:"ที่ 10:30 /กม. · HR 141–150"},
+    {id:"e2",day:"พฤ. 17",t:"<b>3 กม.</b> ที่เพซวันแข่ง",tp:9.5,td:3,ty:"q",m:"วิ่ง 3 กม. รวดเดียว ที่ 9:15–9:30 ไม่หยุด ไม่เดิน · จบแล้วเดินพัก 3 นาที ต่อด้วย 4 × (วิ่งเร็ว 1 นาที + เดิน 1 นาที)",dec:"เมนูนี้ฝึกจำความรู้สึกของเพซวันแข่ง สิ่งสำคัญคือทั้ง 3 กิโลเพซเท่ากัน ไม่ใช่เฉลี่ยได้ · ถ้ากิโลแรก 9:00 กิโลสอง 9:40 ถือว่าไม่ผ่าน แม้เฉลี่ยจะได้ 9:20"},
+    {id:"e3",day:"ส. 19",t:"Long run <b>9.5 กม.</b> ซ้อมเสมือนจริง",tp:9.6,td:9.5,ty:"long",
+     m:"ที่ 9:35 /กม. · ชุดเดิม เวลาเดิม วิ่ง 9 / เดิน 1",
+     dec:"ถ้าทำได้ 9:35 โดยไม่หมดแรง = พร้อมสำหรับ 1:35 แน่นอน"}]},
+  {w:6,d:"21–26 ก.ย.",p:"ก่อนแข่ง",s:[
+    {id:"f1",day:"อ. 22",t:"Easy run <b>4 กม.</b>",tp:10.5,td:4,ty:"easy",m:"ที่ 10:30 /กม. · HR 141–150 · ขาจะเริ่มอยากวิ่ง อย่าเพิ่ม"},
+    {id:"f2",day:"พฤ. 24",t:"<b>3 กม.</b> + strides",tp:10.5,td:3,ty:"easy",m:"วิ่งสบาย ๆ 3 กม. HR ไม่เกิน 150 · จบแล้วต่อด้วย 4 × (วิ่งเร็ว 20 วินาที + เดินพักจนหายเหนื่อย)"},
+    {id:"f3",day:"ส. 26",t:"🏁 <b>แข่ง 10K</b>",race:1,tp:9.5,td:10,ty:"race",m:"วิ่ง 9 นาที / เดิน 1 นาที",
+     dec:"กม.1–3 ที่ 9:45 หัวใจ 145–155 · กม.4–8 ที่ 9:25 หัวใจ 152–162 · กม.9–10 ปล่อยเต็มที่"}]}
+  ];
+
+  var SHIN=["#2E7D74","#E9A13B","#D9524B"];
+  var LOG={}, openId=null, shin=null;
+
+  function pace(d,t){
+    d=Number(d); t=Number(t);
+    if(!d||!t||d<=0||t<=0) return "—";
+    var p=t/d, m=Math.floor(p), s=Math.round((p-m)*60);
+    if(s===60){m++;s=0;}
+    return m+":"+(s<10?"0":"")+s;
+  }
+  function pnum(x){ var m=Math.floor(x),s=Math.round((x-m)*60);
+    if(s===60){m++;s=0;} return m+":"+(s<10?"0":"")+s; }
+  function secs(x){ var t=Math.round(Math.abs(x)*60),m=Math.floor(t/60),s=t%60;
+    return m===0 ? s+" วินาที" : m+" นาที "+s+" วินาที"; }
+  function esc(x){ return String(x).replace(/&/g,"&amp;").replace(/</g,"&lt;"); }
+
+  function judge(S,e){
+    if(!e) return null;
+    var d=Number(e.dist), t=Number(e.time), p=t/d, tp=S.tp, gap=p-tp;
+    if(e.shin===2)
+      return {lv:2,txt:"หน้าแข้งเจ็บ ให้พัก 3-5 วัน แล้วกลับมาวิ่งครึ่งระยะ วันนี้ไม่ต้องสนใจเพซ"};
+    if(S.td && d < S.td*0.8)
+      return {lv:1,txt:"วิ่งได้ "+d.toFixed(1)+" กิโล จากที่ตั้งไว้ "+S.td+" กิโล ครั้งหน้าเน้นให้ครบก่อน ยังไม่ต้องเร่ง"};
+    if(!tp) return {lv:0,txt:"วันนี้ไม่ต้องดูเพซ ทำครบก็ถือว่าผ่าน"};
+    if(S.ty==="easy"){
+      if(gap < -0.5)
+        return {lv:1,txt:"วันนี้เร็วไป "+secs(-gap)+" ต่อกิโล วัน easy run ควรช้ากว่านี้ ครั้งหน้าลองช้าลงจนรู้สึกว่าช้าเกินไป นั่นแหละถูกแล้ว"};
+      if(e.hr && e.hr>152)
+        return {lv:1,txt:"หัวใจ "+e.hr+" สูงไปสำหรับวัน easy run ครั้งหน้าช้าลงอีก หรือใส่ช่วงเดินสลับ ให้ไม่เกิน 150"};
+      return {lv:0,txt:"วัน easy run ทำได้เบาจริง แบบนี้ถูกต้อง ขาจะได้ฟื้น"};
+    }
+    if(gap <= -0.5)
+      return {lv:0,txt:"เร็วกว่าที่ตั้งไว้ "+secs(-gap)+" ต่อกิโล ฟอร์มดีมาก แต่พอแค่นี้ อย่าเร่งเพิ่มอีก"};
+    if(gap <= 0.25)
+      return {lv:0,txt:"ได้ตามที่ตั้งไว้พอดี (เป้า "+pnum(tp)+" ต่อกิโล) ทำต่อแบบนี้ได้เลย"};
+    if(gap <= 0.75)
+      return {lv:1,txt:"ช้ากว่าที่ตั้งไว้ "+secs(gap)+" ต่อกิโล ยังไม่ต้องกังวล ถ้าวันนั้นร้อนหรือฝนตกถือว่าปกติ"};
+    return {lv:2,txt:"ช้ากว่าที่ตั้งไว้ "+secs(gap)+" ต่อกิโล ครั้งหน้าลองลดระยะลง 1 กิโล แล้วเน้นทำเพซให้ได้แทน"};
+  }
+
+  function status(txt,bad){
+    var el=$("sv"); if(!el) return;
+    el.textContent=txt; el.className = bad ? "sv bad" : "sv";
+  }
+  // ---------- ระบบบันทึก: ลองหลายทางไล่กัน ----------
+  var mode = "";   // "ls" = เบราว์เซอร์ / "cl" = ระบบ Claude / "" = ยังไม่รู้
+
+  function lsSave(){
+    try{
+      window.localStorage.setItem(KEY, JSON.stringify(LOG));
+      return window.localStorage.getItem(KEY) !== null;
+    }catch(e){ return false; }
+  }
+  function lsLoad(){
+    try{
+      var v = window.localStorage.getItem(KEY);
+      if(!v) return "empty";
+      LOG = JSON.parse(v);
+      return true;
+    }catch(e){ return false; }
+  }
+
+  function persist(){
+    // 1) เบราว์เซอร์ก่อน เพราะใช้ได้ตอนเปิดจากหน้าจอโฮม
+    if(lsSave()){
+      mode = "ls";
+      status("บันทึกลงเครื่องแล้ว "+new Date().toLocaleTimeString("th-TH",
+        {hour:"2-digit",minute:"2-digit"}));
+      var b0=$("box"); if(b0) b0.className="hide";
+      return;
+    }
+    // 2) ระบบของ Claude
+    if(window.storage && window.storage.set){
+      status("กำลังบันทึก…");
+      var pr=null;
+      try{ pr = window.storage.set(KEY, JSON.stringify(LOG), false); }catch(e){}
+      if(pr && typeof pr.then === "function"){
+        pr.then(function(){
+          mode="cl";
+          status("บันทึกแล้ว "+new Date().toLocaleTimeString("th-TH",
+            {hour:"2-digit",minute:"2-digit"}));
+        })["catch"](function(){ showBackup(); });
+        return;
+      }
+    }
+    // 3) สำรองด้วยมือ
+    showBackup();
+  }
+
+  function showBackup(){
+    status("บันทึกอัตโนมัติไม่ได้ในหน้านี้ ให้คัดลอกข้อความในกล่องด้านล่างเก็บไว้ "+
+           "ครั้งหน้าเปิดมาแล้ววางกลับ", 1);
+    var b=$("box");
+    if(b){ b.className=""; b.value=JSON.stringify(LOG); }
+  }
+
+  function render(){
+    var now=new Date(), today=new Date(now.getFullYear(),now.getMonth(),now.getDate());
+    var days=Math.round((RACE-today)/86400000);
+    $("cdn").textContent = days>0?days:"0";
+    if(days>0) $("lede").textContent = "เหลือ "+Math.floor(days/7)+" สัปดาห์ "+(days%7)+
+      " วัน · เป้า 1:35:00 · race pace 9:30 /กม.";
+
+    var n=0,km=0,tm=0,k;
+    for(k in LOG){ if(!LOG.hasOwnProperty(k)) continue;
+      var e=LOG[k]; if(e&&Number(e.dist)>0){n++;km+=Number(e.dist);tm+=Number(e.time)||0;} }
+    $("sD").innerHTML=n+"<small>/18</small>";
+    $("sK").innerHTML=km.toFixed(1)+"<small> กม.</small>";
+    $("sP").textContent=pace(km,tm);
+
+    var cur=null,a,b;
+    for(a=0;a<PLAN.length&&cur===null;a++)
+      for(b=0;b<PLAN[a].s.length;b++) if(!LOG[PLAN[a].s[b].id]){cur=PLAN[a].w;break;}
+
+    var h="";
+    for(a=0;a<PLAN.length;a++){
+      var W=PLAN[a];
+      h+='<div class="wk"><div class="wk-h"><div class="wk-n">สัปดาห์ '+W.w+'</div>'+
+         '<div class="wk-d">'+W.d+'</div><div class="wk-p'+(W.w===cur?" now":"")+'">'+
+         (W.w===cur?"ตอนนี้":W.p)+'</div></div>';
+      for(b=0;b<W.s.length;b++){
+        var S=W.s[b], E=LOG[S.id];
+        var col = E ? SHIN[E.shin||0] : null;
+        h+='<div class="row'+(E?" on":"")+'">'+
+           '<div class="sp"><div class="node'+(E?" done":"")+(S.race?" race":"")+'"'+
+           (col?' style="background:'+col+'"':'')+'></div></div>'+
+           '<div class="bc">'+
+           '<div class="r-top"><div class="r-d">'+S.day+'</div>'+
+           '<div class="r-t">'+S.t+'</div>'+
+           '<button class="tap'+(E?" has":"")+'" data-id="'+S.id+'">'+
+           (E?"แก้ไข":"บันทึก")+'</button></div>';
+        h+='<div class="r-m">'+S.m+(S.tp&&!E?' · เป้า '+pnum(S.tp)+' /กม.':'')+'</div>';
+        if(E){
+          h+='<div class="res"><div>'+Number(E.dist).toFixed(2)+' <span>กม.</span></div>'+
+             '<div>'+pace(E.dist,E.time)+' <span>/กม.</span></div>'+
+             (E.hr?'<div>'+E.hr+' <span>หัวใจ</span></div>':'')+'</div>';
+          if(E.note) h+='<div class="note">'+esc(E.note)+'</div>';
+          var v=judge(S,E);
+          if(v) h+='<div class="vd v'+v.lv+'"><b>'+
+            ["ดีแล้ว","ปรับนิดหน่อย","ต้องแก้"][v.lv]+'</b>'+v.txt+'</div>';
+        }
+        if(S.dec) h+='<div class="dec">'+S.dec+'</div>';
+        if(openId===S.id) h+=form(S,E);
+        h+='</div></div>';
+      }
+      h+='</div>';
+    }
+    $("plan").innerHTML=h;
+    wire();
+  }
+
+  function form(S,E){
+    return '<div class="edit">'+
+      '<div class="duo">'+
+        '<div class="fl"><label>ระยะ (กม.)</label>'+
+        '<input type="number" id="fD" step="0.01" inputmode="decimal" value="'+(E?E.dist:"")+'" placeholder="0.00"></div>'+
+        '<div class="fl"><label>เวลา (นาที)</label>'+
+        '<input type="number" id="fT" step="0.1" inputmode="decimal" value="'+(E?E.time:"")+'" placeholder="0"></div>'+
+      '</div>'+
+      '<div class="pv"><div class="pv-l">เพซเฉลี่ย</div><div class="pv-v" id="fP">—</div></div>'+
+      '<div class="fl"><label>หัวใจเฉลี่ย (ไม่บังคับ)</label>'+
+      '<input type="number" id="fH" inputmode="numeric" value="'+(E&&E.hr?E.hr:"")+'" placeholder="เช่น 148"></div>'+
+      '<div class="fl"><label>หน้าแข้งหลังวิ่ง</label><div class="chips" id="fS">'+
+        '<button class="chip'+(shin===0?" on":"")+'" data-v="0">ปกติ</button>'+
+        '<button class="chip'+(shin===1?" on":"")+'" data-v="1">ตึง ๆ</button>'+
+        '<button class="chip'+(shin===2?" on":"")+'" data-v="2">เจ็บ</button>'+
+      '</div></div>'+
+      '<div class="fl"><label>โน้ต (ไม่บังคับ)</label>'+
+      '<input type="text" id="fN" value="'+(E&&E.note?esc(E.note):"")+'" placeholder="อากาศ ความรู้สึก"></div>'+
+      '<div class="acts"><button class="b b2" id="bX">ปิด</button>'+
+      (E?'<button class="b b3" id="bDel">ลบ</button>':'')+
+      '<button class="b b1" id="bOK">บันทึก</button></div></div>';
+  }
+
+  function calc(){
+    var p=$("fP"); if(!p) return;
+    p.textContent=pace($("fD")?$("fD").value:0, $("fT")?$("fT").value:0);
+  }
+
+  function wire(){
+    var t=document.getElementsByClassName("tap"), i;
+    for(i=0;i<t.length;i++){
+      (function(btn){
+        btn.addEventListener("click",function(){
+          var id=btn.getAttribute("data-id");
+          if(openId===id){ openId=null; }
+          else{
+            openId=id;
+            var E=LOG[id];
+            shin = E ? (E.shin||0) : null;
+          }
+          render();
+        });
+      })(t[i]);
+    }
+    if(!openId) return;
+    if($("fD")){ $("fD").addEventListener("input",calc); }
+    if($("fT")){ $("fT").addEventListener("input",calc); }
+    calc();
+    var c=$("fS");
+    if(c){
+      var bs=c.getElementsByTagName("button");
+      for(i=0;i<bs.length;i++){
+        (function(b){
+          b.addEventListener("click",function(){
+            shin=parseInt(b.getAttribute("data-v"),10);
+            for(var z=0;z<bs.length;z++) bs[z].className="chip";
+            b.className="chip on";
+          });
+        })(bs[i]);
+      }
+    }
+    if($("bX")) $("bX").addEventListener("click",function(){ openId=null; render(); });
+    if($("bDel")) $("bDel").addEventListener("click",function(){
+      delete LOG[openId]; openId=null; persist(); render();
+    });
+    if($("bOK")) $("bOK").addEventListener("click",function(){
+      var d=parseFloat($("fD").value), t2=parseFloat($("fT").value);
+      if(!d||!t2){ alert("ใส่ระยะกับเวลาก่อน"); return; }
+      LOG[openId]={dist:d,time:t2,hr:parseFloat($("fH").value)||null,
+                   shin: shin===null?0:shin, note:$("fN").value.replace(/^\\s+|\\s+$/g,"")};
+      openId=null; persist(); render();
+    });
+  }
+
+  $("src").addEventListener("click",function(){
+    var code = "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
+    var b=$("box"); b.className=""; b.value=code;
+    b.focus(); b.setSelectionRange(0, code.length);
+    var done=false;
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(code).then(function(){
+        status("คัดลอกโค้ดแล้ว ("+Math.round(code.length/1024)+" KB) เอาไปวางในไฟล์ index.html บน GitHub");
+      })["catch"](function(){
+        status("กดค้างในกล่องด้านล่าง แล้วเลือก เลือกทั้งหมด → คัดลอก");
+      });
+    } else {
+      status("กดค้างในกล่องด้านล่าง แล้วเลือก เลือกทั้งหมด → คัดลอก");
+    }
+  });
+  $("exp").addEventListener("click",function(){
+    var b=$("box"); b.className=""; b.value=JSON.stringify(LOG);
+    b.select(); status("คัดลอกข้อความในกล่องเก็บไว้ ถ้าข้อมูลหายให้เอามาวางที่ปุ่มกู้ข้อมูล");
+  });
+  $("imp").addEventListener("click",function(){
+    var b=$("box");
+    if(b.className==="hide"){ b.className=""; b.value=""; 
+      status("วางข้อความที่สำรองไว้ในกล่อง แล้วกดปุ่มกู้ข้อมูลอีกครั้ง"); return; }
+    try{
+      var d=JSON.parse(b.value);
+      LOG=d; render(); persist(); status("กู้ข้อมูลแล้ว");
+    }catch(e){ status("ข้อความที่วางไม่ถูกต้อง",1); }
+  });
+  $("rst").addEventListener("click",function(){
+    if(!confirm("ล้างผลการซ้อมทั้งหมด?")) return;
+    LOG={}; openId=null; persist(); render();
+  });
+
+  LOG={}; render();
+
+  // ---------- โหลดตอนเปิด ----------
+  var r = lsLoad();
+  if(r === true){
+    mode="ls"; render(); status("โหลดข้อมูลจากเครื่องแล้ว");
+  } else if(window.storage && window.storage.get){
+    status("กำลังโหลดข้อมูล…");
+    var pg=null;
+    try{ pg = window.storage.get(KEY, false); }catch(e){}
+    if(pg && typeof pg.then === "function"){
+      pg.then(function(res){
+        if(res && res.value){
+          try{ LOG=JSON.parse(res.value); mode="cl"; render();
+               status("โหลดข้อมูลแล้ว"); return; }catch(e){}
+        }
+        status("ยังไม่มีข้อมูล เริ่มบันทึกได้เลย");
+      })["catch"](function(){ status("ยังไม่มีข้อมูล เริ่มบันทึกได้เลย"); });
+    } else {
+      status("ยังไม่มีข้อมูล เริ่มบันทึกได้เลย");
+    }
+  } else {
+    status(r==="empty" ? "ยังไม่มีข้อมูล เริ่มบันทึกได้เลย"
+                       : "เปิดจากหน้าจอโฮมเพื่อให้บันทึกข้อมูลได้");
+  }
+
+  }catch(e){
+    fail("หน้านี้โหลดไม่สมบูรณ์: "+e.message);
+  }
+})();
+</script>
+
+
+</body></html>
