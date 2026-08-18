@@ -1,404 +1,7 @@
+
 <!DOCTYPE html>
-<html lang="th" style="background-color: transparent;"><head>
-    <script>
-      (function() {
-        // Capture host references before any artifact code runs: Window.parent
-        // is [Replaceable] (a top-level `var parent` in artifact code would
-        // replace the accessor with a data property), and a top-level
-        // `const crypto` would shadow the global — either would otherwise
-        // silently break the bridge for artifacts that worked before.
-        const realParent = window.parent;
-        const cryptoObj = window.crypto;
-        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
-        // parser-blocking tag. Native fetch, captured before the proxy override below.
-        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
-        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
-        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
-        let htmlToImageLoad = null;
-        const loadHtmlToImage = () => {
-          if (!htmlToImageLoad) {
-            htmlToImageLoad = (realFetch
-              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
-              : Promise.reject(new Error('fetch unavailable'))
-            )
-              .then((res) => {
-                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
-                return res.text();
-              })
-              .then((source) => {
-                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
-                // window-global branch; inline script text runs synchronously on insert.
-                const hidden = ['define', 'module', 'exports'].map((k) => {
-                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
-                  try { window[k] = undefined; } catch (e) {}
-                  return entry;
-                });
-                try {
-                  const el = document.createElement('script');
-                  el.text = source;
-                  (document.head || document.documentElement).appendChild(el);
-                } finally {
-                  hidden.forEach(({ k, own, v }) => {
-                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
-                  });
-                }
-                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
-                return window.htmlToImage;
-              });
-            // A failed load may be transient; let the next screenshot retry.
-            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
-          }
-          return htmlToImageLoad;
-        };
-        // crypto.randomUUID exists only in Secure Contexts; fall back to a
-        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
-        // uniqueness is what the bridge needs, unpredictability is
-        // defense-in-depth on top of the source guards.
-        const newRequestId =
-          cryptoObj && typeof cryptoObj.randomUUID === "function"
-            ? function () { return cryptoObj.randomUUID(); }
-            : function () { return Date.now() + "-" + Math.random(); };
-        const originalConsole = window.console;
-        window.console = {
-          log: (...args) => {
-            originalConsole.log(...args);
-            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
-          },
-          error: (...args) => {
-            originalConsole.error(...args);
-            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
-          },
-          warn: (...args) => {
-            originalConsole.warn(...args);
-            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
-          }
-        };
-
-        // Bridge request ids are crypto-random (not sequential) so they
-        // cannot be predicted by other frames in the tab.
-        let callbacksMap = new Map();
-        let streamControllers = new Map();
-        
-        window.claude = {
-          complete: (prompt) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
-            });
-          }
-        };
-
-        window.storage = {
-          get: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
-            });
-          },
-          set: (key, value, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
-            });
-          },
-          delete: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
-            });
-          },
-          list: (prefix, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
-            });
-          }
-        };
-
-        let pendingBlobs = new Map();
-        URL.createObjectURL = (blob) => {
-          // Store the blob and create an ID and URL for it
-          const blobId = `blob-${Date.now()}-${Math.random()}`;
-          pendingBlobs.set(blobId, blob);
-          return `blob-request://${blobId}`;
-        };
-
-        URL.revokeObjectURL = (url) => {
-          // Remove the blob from our store
-          const blobId = url.replace("blob-request://", "");
-          pendingBlobs.delete(blobId);
-        };
-
-        const getBlobFromURL = (url) => {
-          const blobId = url.replace("blob-request://", "");
-          return pendingBlobs.get(blobId);
-        };
-
-        // Override global fetch with streaming support
-        window.fetch = (url, init = {}) => {
-          return new Promise((resolve, reject) => {
-            const id = newRequestId();
-            const channelId = `fetch-${id}-${Date.now()}`;
-            
-            callbacksMap.set(id, { 
-              resolve: (response) => {
-                // Null-body statuses: Response(stream, {status: 204}) throws
-                // per the Fetch spec, which would escape this resolver and
-                // hang the artifact's await forever.
-                if (response.status === 204 || response.status === 205 || response.status === 304) {
-                  try {
-                    resolve(new Response(null, {
-                      status: response.status,
-                      statusText: response.statusText,
-                      headers: response.headers
-                    }));
-                  } catch (err) {
-                    // Invalid statusText/header bytes can throw here too.
-                    reject(new TypeError(
-                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                    ));
-                  }
-                  return;
-                }
-                // Create a ReadableStream for the response body
-                const stream = new ReadableStream({
-                  start(controller) {
-                    streamControllers.set(channelId, controller);
-                  },
-                  cancel() {
-                    streamControllers.delete(channelId);
-                  }
-                });
-                
-                // Create and return the Response with the stream. Response()
-                // requires status in [200, 599]; an opaque/no-cors fetch
-                // forwards status 0, which would throw here and escape the
-                // resolver, hanging the artifact's await. Surface it as a
-                // network-error-shaped rejection instead.
-                try {
-                  resolve(new Response(stream, {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: response.headers
-                  }));
-                } catch (err) {
-                  streamControllers.delete(channelId);
-                  reject(new TypeError(
-                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                  ));
-                }
-              },
-              reject,
-              channelId
-            });
-            
-            realParent.postMessage({
-              type: 'proxyFetch',
-              id,
-              url,
-              init,
-              channelId
-            }, '*');
-          });
-        };
-
-        window.addEventListener('message', async (event) => {
-          // Only the embedding parent may drive the bridge — sibling and
-          // nested frames can also postMessage into this window.
-          if (event.source !== realParent) return;
-          if (event.data.type === 'takeScreenshot') {
-            // Echo the request's nonce so the requester can correlate the
-            // reply to ITS request — a reply without the expected nonce
-            // (e.g. from a stale pre-remount artifact) is ignored upstream.
-            const screenshotNonce = event.data.nonce;
-            const rootElement = document.getElementById('artifacts-component-root-html');
-            if (!rootElement) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: new Error('Root element not found'),
-              }, '*');
-              return;
-            }
-            // Catch CDN load failures and toPng errors so the parent always
-            // gets a response instead of hanging forever.
-            try {
-              const htmlToImage = await loadHtmlToImage();
-              const screenshot = await htmlToImage.toPng(rootElement, {
-                imagePlaceholder:
-                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
-              });
-              realParent.postMessage({
-                type: 'screenshotData',
-                nonce: screenshotNonce,
-                data: screenshot,
-              }, '*');
-            } catch (err) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: err instanceof Error ? err : new Error(String(err)),
-              }, '*');
-            }
-          } else if (event.data.type === 'claudeComplete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.completion);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'proxyFetchResponse') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-              callbacksMap.delete(event.data.id);
-            } else {
-              // Initial response with headers, status, etc.
-              callback.resolve({
-                status: event.data.status,
-                statusText: event.data.statusText,
-                headers: event.data.headers
-              });
-              // Don't delete the callback yet if streaming
-              if (!event.data.body) {
-                callbacksMap.delete(event.data.id);
-              }
-            }
-          } else if (event.data.type === 'proxyFetchStream') {
-            // Handle streaming data chunks
-            const controller = streamControllers.get(event.data.channelId);
-            if (controller) {
-              if (event.data.error) {
-                controller.error(new Error(event.data.error));
-                streamControllers.delete(event.data.channelId);
-              } else if (event.data.done) {
-                controller.close();
-                streamControllers.delete(event.data.channelId);
-                // Clean up the callback
-                const callback = Array.from(callbacksMap.entries()).find(
-                  ([_, value]) => value.channelId === event.data.channelId
-                );
-                if (callback) {
-                  callbacksMap.delete(callback[0]);
-                }
-              } else if (event.data.chunk) {
-                controller.enqueue(new Uint8Array(event.data.chunk));
-              }
-            }
-          } else if (event.data.type === 'storageGet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageSet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageDelete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageList') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          }
-        });
-
-        window.addEventListener('click', (event) => {
-          const isEl = event.target instanceof HTMLElement;
-          if (!isEl) return;
-    
-          // find ancestor links
-          const linkEl = event.target.closest("a");
-          if (!linkEl || !linkEl.href) return;
-    
-          event.preventDefault();
-          event.stopImmediatePropagation();
-    
-          if (linkEl.href.startsWith("blob-request:")) {
-            const blob = getBlobFromURL(linkEl.href);
-            if (!blob) return;
-            void blob.arrayBuffer().then((data) => {
-              realParent.postMessage({
-                type: "downloadFile",
-                filename: linkEl.download,
-                data,
-                mimeType: blob.type || "application/octet-stream",
-              });
-            });
-          } else if (linkEl.href.startsWith("data:")) {
-            const [header, base64Data] = linkEl.href.split(",");
-            const mimeMatch = header.match(/data:([^;]+)/);
-            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
-            const binaryString = atob(base64Data);
-            const data = Uint8Array.from(binaryString, (c) =>
-              c.charCodeAt(0),
-            ).buffer;
-            realParent.postMessage({
-              type: "downloadFile",
-              filename: linkEl.download,
-              data,
-              mimeType,
-            });
-          } else {
-            let linkUrl;
-            try {
-              linkUrl = new URL(linkEl.href);
-            } catch (error) {
-              return;
-            }
-    
-            if (linkUrl.hostname === window.location.hostname) return;
-      
-            realParent.postMessage({
-              type: 'openExternal',
-              href: linkEl.href,
-            }, '*');
-          }
-      });
-
-        const originalOpen = window.open;
-        window.open = function (url) {
-          realParent.postMessage({
-            type: "openExternal",
-            href: url,
-          }, "*");
-        };
-
-        window.addEventListener('error', (event) => {
-          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
-        });
-      })();
-    </script>
-  
+<html lang="th">
+<head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -406,18 +9,23 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="10K">
 <meta name="theme-color" content="#0E1C24">
+<meta name="color-scheme" content="dark">
+<meta name="supported-color-schemes" content="dark">
 <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 180 180%22%3E%3Crect width=%22180%22 height=%22180%22 rx=%2240%22 fill=%22%230E1C24%22/%3E%3Ctext x=%2290%22 y=%22104%22 font-family=%22-apple-system,sans-serif%22 font-size=%2266%22 font-weight=%22800%22 fill=%22%23E9A13B%22 text-anchor=%22middle%22%3E10K%3C/text%3E%3Ctext x=%2290%22 y=%22138%22 font-family=%22-apple-system,sans-serif%22 font-size=%2222%22 fill=%22%239FB3B4%22 text-anchor=%22middle%22%3ETRAINING%3C/text%3E%3C/svg%3E">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 180 180%22%3E%3Crect width=%22180%22 height=%22180%22 rx=%2240%22 fill=%22%230E1C24%22/%3E%3Ctext x=%2290%22 y=%22104%22 font-family=%22-apple-system,sans-serif%22 font-size=%2266%22 font-weight=%22800%22 fill=%22%23E9A13B%22 text-anchor=%22middle%22%3E10K%3C/text%3E%3Ctext x=%2290%22 y=%22138%22 font-family=%22-apple-system,sans-serif%22 font-size=%2222%22 fill=%22%239FB3B4%22 text-anchor=%22middle%22%3ETRAINING%3C/text%3E%3C/svg%3E">
 <title>10K training</title>
 <style>
   :root{
+    color-scheme: dark only;
     --bg:#0E1C24; --card:#152A33; --ink:#E4EBEA; --dim:#9FB3B4;
     --line:rgba(228,235,234,.15); --teal:#2E7D74; --gold:#E9A13B; --coral:#D9524B;
     --f:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans Thai","Sarabun",Roboto,sans-serif;
   }
   *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
-  html,body{background:#0E1C24;min-height:100%}
-  body{color:#E4EBEA;font-family:var(--f);font-size:15px;line-height:1.55;padding:0 0 calc(60px + env(safe-area-inset-bottom))}
+  html{background-color:#0E1C24 !important;min-height:100%}
+  body{background-color:#0E1C24 !important;min-height:100vh}
+  html,body{-webkit-text-size-adjust:100%}
+  body{color:#E4EBEA !important;font-family:var(--f);font-size:15px;line-height:1.55;padding:0 0 calc(60px + env(safe-area-inset-bottom))}
   .wrap{max-width:600px;margin:0 auto;padding:0 calc(16px + env(safe-area-inset-left)) 0 calc(16px + env(safe-area-inset-right))}
 
   header{padding:calc(26px + env(safe-area-inset-top)) 0 20px;border-bottom:1px solid var(--line)}
@@ -529,20 +137,20 @@
     padding:12px;border-radius:5px;font-size:13px;margin-bottom:12px}
 </style>
 </head>
-<body id="artifacts-component-root-html" style="background-color: transparent;">
+<body>
 <div class="wrap">
 
   <header>
     <div class="kicker">10K TRAINING · 26 ก.ย. 2026</div>
-    <div class="cd"><div class="cd-n" id="cdn">38</div><div class="cd-l">วันก่อนแข่ง</div></div>
-    <div class="lede" id="lede">เหลือ 5 สัปดาห์ 3 วัน · เป้า 1:35:00 · race pace 9:30 /กม.</div>
+    <div class="cd"><div class="cd-n" id="cdn">—</div><div class="cd-l">วันก่อนแข่ง</div></div>
+    <div class="lede" id="lede">เป้า 1:35:00 · race pace 9:30 /กม.</div>
   </header>
 
   <div id="err"></div>
 
   <div class="stats">
     <div class="st"><div class="st-v" id="sD">0<small>/18</small></div><div class="st-l">ซ้อมแล้ว</div></div>
-    <div class="st"><div class="st-v" id="sK">0.0<small> กม.</small></div><div class="st-l">ระยะสะสม</div></div>
+    <div class="st"><div class="st-v" id="sK">0<small> กม.</small></div><div class="st-l">ระยะสะสม</div></div>
     <div class="st"><div class="st-v" id="sP">—</div><div class="st-l">เพซเฉลี่ย</div></div>
   </div>
 
@@ -552,19 +160,19 @@
     <div class="lg"><span class="dot" style="background:#D9524B"></span>เจ็บ</div>
     <div class="lg"><span class="dot" style="border:2px solid #9FB3B4"></span>ยังไม่ซ้อม</div>
   </div>
-  <div class="sv" id="sv">คัดลอกโค้ดแล้ว (51 KB) เอาไปวางในไฟล์ index.html บน GitHub</div>
-  <div id="plan"><div class="wk"><div class="wk-h"><div class="wk-n">สัปดาห์ 1</div><div class="wk-d">17–23 ส.ค.</div><div class="wk-p now">ตอนนี้</div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">อ. 18</div><div class="r-t">Easy run <b>4 กม.</b></div><button class="tap" data-id="a1">บันทึก</button></div><div class="r-m">ที่ 10:30 /กม. · HR 141–150 · เป้า 10:30 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">พฤ. 20</div><div class="r-t">Interval <b>5 × 2 นาที</b></div><button class="tap" data-id="a2">บันทึก</button></div><div class="r-m">วอร์ม 10 นาที · แล้วทำ 5 รอบ = วิ่งเร็ว 2 นาที ที่ 9:00 + เดิน 2 นาที · คูลดาวน์ 5 นาที · เป้า 10:00 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">ส. 22</div><div class="r-t">Long run <b>7 กม.</b></div><button class="tap" data-id="a3">บันทึก</button></div><div class="r-m">ที่ 10:15 /กม. · พื้นราบ ครึ่งหลังค่อยเร่ง · เป้า 10:15 /กม.</div></div></div></div><div class="wk"><div class="wk-h"><div class="wk-n">สัปดาห์ 2</div><div class="wk-d">24–30 ส.ค.</div><div class="wk-p">สร้างฐาน</div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">อ. 25</div><div class="r-t">Easy run <b>5 กม.</b></div><button class="tap" data-id="b1">บันทึก</button></div><div class="r-m">ที่ 10:30 /กม. · HR 141–150 · เป้า 10:30 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">พฤ. 27</div><div class="r-t">Tempo <b>2 × 6 นาที</b></div><button class="tap" data-id="b2">บันทึก</button></div><div class="r-m">วอร์ม 10 นาที · วิ่งต่อเนื่อง 6 นาที ที่ 9:00–9:15 · เดินพัก 3 นาที · วิ่งอีก 6 นาที · คูลดาวน์ · เป้า 10:00 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">ส. 29</div><div class="r-t">Long run <b>8 กม.</b></div><button class="tap" data-id="b3">บันทึก</button></div><div class="r-m">ที่ 10:15 /กม. · วิ่ง 6 นาที / เดิน 1 นาที · เป้า 10:15 /กม.</div></div></div></div><div class="wk"><div class="wk-h"><div class="wk-n">สัปดาห์ 3</div><div class="wk-d">31 ส.ค.–6 ก.ย.</div><div class="wk-p">สร้างฐาน</div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">อ. 1</div><div class="r-t">Easy run <b>5 กม.</b></div><button class="tap" data-id="c1">บันทึก</button></div><div class="r-m">ที่ 10:30 /กม. · HR 141–150 · เป้า 10:30 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">พฤ. 3</div><div class="r-t">Hill repeats <b>8 × 1 นาที</b></div><button class="tap" data-id="c2">บันทึก</button></div><div class="r-m">วอร์ม 10 นาที · แล้วทำ 8 เที่ยว = วิ่งขึ้นเนิน 1 นาที + เดินลง 1:30 · ห้ามวิ่งลง · ลู่ วิ่ง 5.5 km/h ชัน 6% / เดิน 4.5 km/h ชัน 0%</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">ส. 5</div><div class="r-t">Long run <b>9 กม.</b></div><button class="tap" data-id="c3">บันทึก</button></div><div class="r-m">ที่ 9:50 /กม. · วิ่ง 8 นาที / เดิน 1 นาที · เป้า 9:50 /กม.</div><div class="dec">จุดตัดสินใจ · ต่ำกว่า 9:20 → ลุ้น 1:30 ได้ · 9:20–9:50 → เป้า 1:35 มั่นคง · ช้ากว่า 9:50 → ปรับเป็น 1:40</div></div></div></div><div class="wk"><div class="wk-h"><div class="wk-n">สัปดาห์ 4</div><div class="wk-d">7–13 ก.ย.</div><div class="wk-p">ผ่อน</div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">อ. 8</div><div class="r-t">Easy run <b>4 กม.</b></div><button class="tap" data-id="d1">บันทึก</button></div><div class="r-m">ที่ 10:30 /กม. · HR 141–150 · สัปดาห์ผ่อน · เป้า 10:30 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">พฤ. 10</div><div class="r-t">Tempo <b>2 × 8 นาที</b></div><button class="tap" data-id="d2">บันทึก</button></div><div class="r-m">วอร์ม 10 นาที · วิ่งต่อเนื่อง 8 นาที ที่ 9:00–9:15 · เดินพัก 3 นาที · วิ่งอีก 8 นาที · คูลดาวน์ · เป้า 10:00 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">ส. 12</div><div class="r-t">Long run <b>6 กม.</b></div><button class="tap" data-id="d3">บันทึก</button></div><div class="r-m">ที่ 10:15 /กม. · ผ่อนโหลด อย่าข้ามสัปดาห์นี้ · เป้า 10:15 /กม.</div></div></div></div><div class="wk"><div class="wk-h"><div class="wk-n">สัปดาห์ 5</div><div class="wk-d">14–20 ก.ย.</div><div class="wk-p">หนักสุด</div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">อ. 15</div><div class="r-t">Easy run <b>5 กม.</b></div><button class="tap" data-id="e1">บันทึก</button></div><div class="r-m">ที่ 10:30 /กม. · HR 141–150 · เป้า 10:30 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">พฤ. 17</div><div class="r-t"><b>3 กม.</b> ที่เพซวันแข่ง</div><button class="tap" data-id="e2">บันทึก</button></div><div class="r-m">วิ่ง 3 กม. รวดเดียว ที่ 9:15–9:30 ไม่หยุด ไม่เดิน · จบแล้วเดินพัก 3 นาที ต่อด้วย 4 × (วิ่งเร็ว 1 นาที + เดิน 1 นาที) · เป้า 9:30 /กม.</div><div class="dec">เมนูนี้ฝึกจำความรู้สึกของเพซวันแข่ง สิ่งสำคัญคือทั้ง 3 กิโลเพซเท่ากัน ไม่ใช่เฉลี่ยได้ · ถ้ากิโลแรก 9:00 กิโลสอง 9:40 ถือว่าไม่ผ่าน แม้เฉลี่ยจะได้ 9:20</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">ส. 19</div><div class="r-t">Long run <b>9.5 กม.</b> ซ้อมเสมือนจริง</div><button class="tap" data-id="e3">บันทึก</button></div><div class="r-m">ที่ 9:35 /กม. · ชุดเดิม เวลาเดิม วิ่ง 9 / เดิน 1 · เป้า 9:36 /กม.</div><div class="dec">ถ้าทำได้ 9:35 โดยไม่หมดแรง = พร้อมสำหรับ 1:35 แน่นอน</div></div></div></div><div class="wk"><div class="wk-h"><div class="wk-n">สัปดาห์ 6</div><div class="wk-d">21–26 ก.ย.</div><div class="wk-p">ก่อนแข่ง</div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">อ. 22</div><div class="r-t">Easy run <b>4 กม.</b></div><button class="tap" data-id="f1">บันทึก</button></div><div class="r-m">ที่ 10:30 /กม. · HR 141–150 · ขาจะเริ่มอยากวิ่ง อย่าเพิ่ม · เป้า 10:30 /กม.</div></div></div><div class="row"><div class="sp"><div class="node"></div></div><div class="bc"><div class="r-top"><div class="r-d">พฤ. 24</div><div class="r-t"><b>3 กม.</b> + strides</div><button class="tap" data-id="f2">บันทึก</button></div><div class="r-m">วิ่งสบาย ๆ 3 กม. HR ไม่เกิน 150 · จบแล้วต่อด้วย 4 × (วิ่งเร็ว 20 วินาที + เดินพักจนหายเหนื่อย) · เป้า 10:30 /กม.</div></div></div><div class="row"><div class="sp"><div class="node race"></div></div><div class="bc"><div class="r-top"><div class="r-d">ส. 26</div><div class="r-t">🏁 <b>แข่ง 10K</b></div><button class="tap" data-id="f3">บันทึก</button></div><div class="r-m">วิ่ง 9 นาที / เดิน 1 นาที · เป้า 9:30 /กม.</div><div class="dec">กม.1–3 ที่ 9:45 หัวใจ 145–155 · กม.4–8 ที่ 9:25 หัวใจ 152–162 · กม.9–10 ปล่อยเต็มที่</div></div></div></div></div>
+  <div class="sv" id="sv">กำลังเริ่ม…</div>
+  <div id="plan"></div>
 
   <div class="card">
     <h2>โซนหัวใจ</h2>
     <table>
-      <tbody><tr><td>Z1 ฟื้นตัว</td><td style="text-align:right;color:#E4EBEA;font-weight:700">130–141</td></tr>
+      <tr><td>Z1 ฟื้นตัว</td><td style="text-align:right;color:#E4EBEA;font-weight:700">130–141</td></tr>
       <tr><td>Z2 Easy run · Long run</td><td style="text-align:right;color:#5FB3A6;font-weight:700">141–152</td></tr>
       <tr><td>Z3 Tempo</td><td style="text-align:right;color:#E4EBEA;font-weight:700">153–164</td></tr>
       <tr><td>Z4 Interval</td><td style="text-align:right;color:#E4EBEA;font-weight:700">164–173</td></tr>
       <tr><td>วันแข่ง กม.1–3</td><td style="text-align:right;color:#E9A13B;font-weight:700">145–155</td></tr>
       <tr><td>วันแข่ง กม.4–8</td><td style="text-align:right;color:#E9A13B;font-weight:700">152–162</td></tr>
-    </tbody></table>
+    </table>
     <div style="font-size:11.5px;color:#9FB3B4;margin-top:10px;line-height:1.5">
       คำนวณจาก HR ขณะพัก 72 · อายุ 30 · HRmax ประมาณ 187 ด้วยวิธี Karvonen
       <br>วัน easy run ควรอยู่ครึ่งล่างของ Z2 คือ 141–148
@@ -574,23 +182,22 @@
   <div class="card">
     <h2>กฎที่ห้ามละเมิด</h2>
     <table>
-      <tbody><tr><td>ห้ามวิ่งสองวันติดกัน ต้องเว้นอย่างน้อย 1 วันเสมอ</td></tr>
+      <tr><td>ห้ามวิ่งสองวันติดกัน ต้องเว้นอย่างน้อย 1 วันเสมอ</td></tr>
       <tr><td>เจ็บเกิน 4 จาก 10 หรือเจ็บมากขึ้นระหว่างวิ่ง ให้หยุดวันนั้นทันที</td></tr>
       <tr><td>บันทึกว่าเจ็บ 2 ครั้งติดกัน ให้พัก 3–5 วัน ไม่ต้องต่อรอง</td></tr>
       <tr><td>สัปดาห์ผ่อนห้ามข้าม ร่างกายแข็งแรงขึ้นตอนพัก ไม่ใช่ตอนซ้อม</td></tr>
-    </tbody></table>
+    </table>
   </div>
 
   <div class="foot">
     แตะปุ่มขวามือของแต่ละวันเพื่อบันทึกผล ระบบจะประเมินให้ทันทีว่าตามเป้าไหม
     <div style="margin-top:14px">
-      <button class="rst" id="src" style="color:#E9A13B">คัดลอกโค้ดทั้งหมด (เอาไปวางใน GitHub)</button>
       <br><br>
       <button class="rst" id="exp">สำรองข้อมูล (คัดลอกเก็บไว้)</button> ·
       <button class="rst" id="imp">กู้ข้อมูลจากที่สำรองไว้</button> ·
       <button class="rst" id="rst">ล้างข้อมูลทั้งหมด</button>
     </div>
-    <textarea id="box" class="" style="width:100%;margin-top:11px;padding:10px;
+    <textarea id="box" class="hide" style="width:100%;margin-top:11px;padding:10px;
       background:rgba(228,235,234,.07);border:1px solid rgba(228,235,234,.15);
       border-radius:4px;color:#E4EBEA;font-family:monospace;font-size:11px;
       height:130px"></textarea>
@@ -864,21 +471,6 @@
     });
   }
 
-  $("src").addEventListener("click",function(){
-    var code = "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
-    var b=$("box"); b.className=""; b.value=code;
-    b.focus(); b.setSelectionRange(0, code.length);
-    var done=false;
-    if(navigator.clipboard && navigator.clipboard.writeText){
-      navigator.clipboard.writeText(code).then(function(){
-        status("คัดลอกโค้ดแล้ว ("+Math.round(code.length/1024)+" KB) เอาไปวางในไฟล์ index.html บน GitHub");
-      })["catch"](function(){
-        status("กดค้างในกล่องด้านล่าง แล้วเลือก เลือกทั้งหมด → คัดลอก");
-      });
-    } else {
-      status("กดค้างในกล่องด้านล่าง แล้วเลือก เลือกทั้งหมด → คัดลอก");
-    }
-  });
   $("exp").addEventListener("click",function(){
     var b=$("box"); b.className=""; b.value=JSON.stringify(LOG);
     b.select(); status("คัดลอกข้อความในกล่องเก็บไว้ ถ้าข้อมูลหายให้เอามาวางที่ปุ่มกู้ข้อมูล");
@@ -928,6 +520,5 @@
   }
 })();
 </script>
-
-
-</body></html>
+</body>
+</html>
